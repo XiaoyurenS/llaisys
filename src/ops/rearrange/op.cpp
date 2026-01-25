@@ -1,7 +1,51 @@
 #include "op.hpp"
 
+#include <cstring>
+
 namespace llaisys::ops {
 void rearrange(tensor_t out, tensor_t in) {
-    TO_BE_IMPLEMENTED();
+    CHECK_SAME_DEVICE(out, in);
+    CHECK_SAME_SHAPE(out->shape(), in->shape());
+    CHECK_SAME_DTYPE(out->dtype(), in->dtype());
+
+    size_t elem_size = out->elementSize();
+    size_t ndim = out->ndim();
+    size_t total = out->numel();
+
+    if (total == 0) {
+        return;
+    }
+
+    if (out->isContiguous() && in->isContiguous()) {
+        std::memcpy(out->data(), in->data(), total * elem_size);
+        return;
+    }
+
+    std::vector<size_t> idx(ndim, 0);
+    const auto &shape = out->shape();
+    const auto &out_strides = out->strides();
+    const auto &in_strides = in->strides();
+
+    for (size_t n = 0; n < total; ++n) {
+        size_t out_offset = 0;
+        size_t in_offset = 0;
+        for (size_t i = 0; i < ndim; ++i) {
+            out_offset += idx[i] * static_cast<size_t>(out_strides[i]);
+            in_offset += idx[i] * static_cast<size_t>(in_strides[i]);
+        }
+
+        std::memcpy(
+            out->data() + out_offset * elem_size,
+            in->data() + in_offset * elem_size,
+            elem_size);
+
+        for (size_t d = ndim; d-- > 0;) {
+            idx[d]++;
+            if (idx[d] < shape[d]) {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
 }
 } // namespace llaisys::ops

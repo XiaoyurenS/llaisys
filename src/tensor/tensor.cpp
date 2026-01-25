@@ -1,6 +1,7 @@
 #include "tensor.hpp"
 
 #include "../utils.hpp"
+#include "../ops/rearrange/op.hpp"
 
 #include <cstring>
 #include <numeric>
@@ -257,18 +258,66 @@ void Tensor::load(const void *src_) {
 }
 
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (this->isContiguous()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto out = Tensor::create(this->shape(), this->dtype(), this->deviceType(), this->deviceId());
+    ops::rearrange(out, std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset)));
+    return out;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    size_t new_numel = std::accumulate(
+        shape.begin(), shape.end(), size_t(1), std::multiplies<size_t>());
+    CHECK_ARGUMENT(
+        new_numel == this->numel(),
+        "Reshape shape must have same number of elements");
+
+    if (this->isContiguous()) {
+        return this->view(shape);
+    }
+
+    return this->contiguous()->view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    int target_device = device;
+    if (target_device < 0) {
+        target_device = (device_type == this->deviceType()) ? this->deviceId() : 0;
+    }
+
+    if (device_type == this->deviceType() && target_device == this->deviceId()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto src = this->isContiguous()
+        ? std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset))
+        : this->contiguous();
+
+    auto dst = Tensor::create(this->shape(), this->dtype(), device_type, target_device);
+
+    core::context().setDevice(device_type, target_device);
+    size_t bytes = src->numel() * src->elementSize();
+
+    if (src->deviceType() == LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        std::memcpy(dst->data(), src->data(), bytes);
+        return dst;
+    }
+
+    llaisysMemcpyKind_t kind = LLAISYS_MEMCPY_D2D;
+    if (src->deviceType() == LLAISYS_DEVICE_CPU && device_type != LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2D;
+    } else if (src->deviceType() != LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_D2H;
+    }
+
+    core::context().runtime().api()->memcpy_sync(
+        dst->data(),
+        src->data(),
+        bytes,
+        kind);
+    return dst;
 }
 
 } // namespace llaisys
