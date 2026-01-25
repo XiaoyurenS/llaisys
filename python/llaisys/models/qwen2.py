@@ -17,7 +17,7 @@ class Qwen2:
         self._device = device
         self._model: llaisysQwen2Model_t | None = None
         self._end_token = None
-        print("[LLAISYS] qwen2 python init (stub)")
+        print("[LLAISYS] qwen2 python init")
 
         model_path = Path(model_path)
 

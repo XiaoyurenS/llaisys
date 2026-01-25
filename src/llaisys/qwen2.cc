@@ -25,6 +25,7 @@ struct LlaisysQwen2Model {
     std::vector<llaisys::tensor_t> k_cache;
     std::vector<llaisys::tensor_t> v_cache;
     size_t cache_len = 0;
+    llaisys::tensor_t pos_ids_cache;
 };
 
 static llaisys::tensor_t unwrap(llaisysTensor_t tensor) {
@@ -86,6 +87,7 @@ __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(
     model->k_cache.resize(nlayer);
     model->v_cache.resize(nlayer);
     model->cache_len = 0;
+    model->pos_ids_cache = nullptr;
 
     return model;
 }
@@ -142,14 +144,31 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t
     auto x = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
     llaisys::ops::embedding(x, index, unwrap(model->weights.in_embed));
 
-    std::vector<int64_t> pos_buf(cur_len);
-    for (size_t i = 0; i < cur_len; ++i) {
-        pos_buf[i] = static_cast<int64_t>(pos_start + i);
+    if (!model->pos_ids_cache) {
+        model->pos_ids_cache = llaisys::Tensor::create({model->meta.maxseq}, LLAISYS_DTYPE_I64, model->device, device_id);
+        std::vector<int64_t> full_pos(model->meta.maxseq);
+        for (size_t i = 0; i < model->meta.maxseq; ++i) {
+            full_pos[i] = static_cast<int64_t>(i);
+        }
+        model->pos_ids_cache->load(full_pos.data());
     }
-    auto pos_ids = llaisys::Tensor::create({cur_len}, LLAISYS_DTYPE_I64, model->device, device_id);
-    pos_ids->load(pos_buf.data());
+    auto pos_ids = model->pos_ids_cache->slice(0, pos_start, pos_start + cur_len);
 
     auto x_cur = x;
+    auto attn_norm = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
+    auto q2d = llaisys::Tensor::create({cur_len, model->meta.nh * model->meta.dh}, model->meta.dtype, model->device, device_id);
+    auto k2d = llaisys::Tensor::create({cur_len, model->meta.nkvh * model->meta.dh}, model->meta.dtype, model->device, device_id);
+    auto v2d = llaisys::Tensor::create({cur_len, model->meta.nkvh * model->meta.dh}, model->meta.dtype, model->device, device_id);
+    auto q_rope = llaisys::Tensor::create({cur_len, model->meta.nh, model->meta.dh}, model->meta.dtype, model->device, device_id);
+    auto k_rope = llaisys::Tensor::create({cur_len, model->meta.nkvh, model->meta.dh}, model->meta.dtype, model->device, device_id);
+    auto attn = llaisys::Tensor::create({cur_len, model->meta.nh, model->meta.dh}, model->meta.dtype, model->device, device_id);
+    auto attn_out = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
+    auto x_attn = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
+    auto mlp_norm = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
+    auto gate = llaisys::Tensor::create({cur_len, model->meta.di}, model->meta.dtype, model->device, device_id);
+    auto up = llaisys::Tensor::create({cur_len, model->meta.di}, model->meta.dtype, model->device, device_id);
+    auto hidden = llaisys::Tensor::create({cur_len, model->meta.di}, model->meta.dtype, model->device, device_id);
+    auto mlp_out = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
     for (size_t layer = 0; layer < model->meta.nlayer; ++layer) {
         if (!model->weights.attn_norm_w[layer] || !model->weights.attn_q_w[layer]
             || !model->weights.attn_k_w[layer] || !model->weights.attn_v_w[layer]
@@ -160,12 +179,7 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t
             return -1;
         }
 
-        auto attn_norm = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
         llaisys::ops::rms_norm(attn_norm, x_cur, unwrap(model->weights.attn_norm_w[layer]), model->meta.epsilon);
-
-        auto q2d = llaisys::Tensor::create({cur_len, model->meta.nh * model->meta.dh}, model->meta.dtype, model->device, device_id);
-        auto k2d = llaisys::Tensor::create({cur_len, model->meta.nkvh * model->meta.dh}, model->meta.dtype, model->device, device_id);
-        auto v2d = llaisys::Tensor::create({cur_len, model->meta.nkvh * model->meta.dh}, model->meta.dtype, model->device, device_id);
 
         llaisys::ops::linear(q2d, attn_norm, unwrap(model->weights.attn_q_w[layer]),
                              model->weights.attn_q_b ? unwrap(model->weights.attn_q_b[layer]) : nullptr);
@@ -178,8 +192,6 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t
         auto k = k2d->view({cur_len, model->meta.nkvh, model->meta.dh});
         auto v = v2d->view({cur_len, model->meta.nkvh, model->meta.dh});
 
-        auto q_rope = llaisys::Tensor::create({cur_len, model->meta.nh, model->meta.dh}, model->meta.dtype, model->device, device_id);
-        auto k_rope = llaisys::Tensor::create({cur_len, model->meta.nkvh, model->meta.dh}, model->meta.dtype, model->device, device_id);
         llaisys::ops::rope(q_rope, q, pos_ids, model->meta.theta);
         llaisys::ops::rope(k_rope, k, pos_ids, model->meta.theta);
 
@@ -209,33 +221,23 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t
         auto v_all = model->v_cache[layer]->slice(0, 0, total_len);
 
         float scale = 1.0f / std::sqrt(static_cast<float>(model->meta.dh));
-        auto attn = llaisys::Tensor::create({cur_len, model->meta.nh, model->meta.dh}, model->meta.dtype, model->device, device_id);
         llaisys::ops::self_attention(attn, q_rope, k_all, v_all, scale);
 
         auto attn2d = attn->view({cur_len, model->meta.hs});
-        auto attn_out = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
         llaisys::ops::linear(attn_out, attn2d, unwrap(model->weights.attn_o_w[layer]), nullptr);
 
-        auto x_attn = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
         llaisys::ops::add(x_attn, x_cur, attn_out);
 
-        auto mlp_norm = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
         llaisys::ops::rms_norm(mlp_norm, x_attn, unwrap(model->weights.mlp_norm_w[layer]), model->meta.epsilon);
 
-        auto gate = llaisys::Tensor::create({cur_len, model->meta.di}, model->meta.dtype, model->device, device_id);
-        auto up = llaisys::Tensor::create({cur_len, model->meta.di}, model->meta.dtype, model->device, device_id);
         llaisys::ops::linear(gate, mlp_norm, unwrap(model->weights.mlp_gate_w[layer]), nullptr);
         llaisys::ops::linear(up, mlp_norm, unwrap(model->weights.mlp_up_w[layer]), nullptr);
 
-        auto hidden = llaisys::Tensor::create({cur_len, model->meta.di}, model->meta.dtype, model->device, device_id);
         llaisys::ops::swiglu(hidden, gate, up);
 
-        auto mlp_out = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
         llaisys::ops::linear(mlp_out, hidden, unwrap(model->weights.mlp_down_w[layer]), nullptr);
 
-        auto x_out = llaisys::Tensor::create({cur_len, model->meta.hs}, model->meta.dtype, model->device, device_id);
-        llaisys::ops::add(x_out, x_attn, mlp_out);
-        x_cur = x_out;
+        llaisys::ops::add(x_cur, x_attn, mlp_out);
     }
 
     if (!use_cache) {
