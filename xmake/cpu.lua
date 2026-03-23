@@ -5,6 +5,11 @@ target("llaisys-device-cpu")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
+    if has_config("cpu-openmp") and not is_plat("windows") then
+        add_cxflags("-fopenmp")
+        add_ldflags("-fopenmp")
+        add_defines("LLAISYS_USE_OPENMP")
+    end
 
     add_files("../src/device/cpu/*.cpp")
 
@@ -19,9 +24,13 @@ target("llaisys-ops-cpu")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
+    if has_config("cpu-openmp") and not is_plat("windows") then
+        add_cxflags("-fopenmp")
+        add_ldflags("-fopenmp")
+        add_defines("LLAISYS_USE_OPENMP")
+    end
 
     add_files("../src/ops/*/cpu/*.cpp")
 
     on_install(function (target) end)
 target_end()
-

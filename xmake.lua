@@ -3,6 +3,12 @@ set_encodings("utf-8")
 
 add_includedirs("include")
 
+option("cpu-openmp")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to enable OpenMP for CPU operators")
+option_end()
+
 -- CPU --
 includes("xmake/cpu.lua")
 
@@ -89,6 +95,11 @@ target("llaisys-ops")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
+    if has_config("cpu-openmp") and not is_plat("windows") then
+        add_cxflags("-fopenmp")
+        add_ldflags("-fopenmp")
+        add_defines("LLAISYS_USE_OPENMP")
+    end
     
     add_files("src/ops/*/*.cpp")
 
@@ -105,6 +116,9 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    if has_config("cpu-openmp") and not is_plat("windows") then
+        add_ldflags("-fopenmp")
+    end
     add_files("src/llaisys/*.cc")
     set_installdir(".")
 
@@ -117,6 +131,9 @@ target("llaisys")
         end
         if is_plat("linux") then
             os.cp("lib/*.so", "python/llaisys/libllaisys/")
+        end
+        if is_plat("macosx") then
+            os.cp("lib/*.dylib", "python/llaisys/libllaisys/")
         end
     end)
 target_end()

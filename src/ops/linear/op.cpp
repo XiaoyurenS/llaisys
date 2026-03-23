@@ -2,40 +2,68 @@
 
 #include "../../utils.hpp"
 
+#include <algorithm>
+#include <array>
 #include <type_traits>
 
 namespace llaisys::ops {
+
+#ifdef LLAISYS_USE_OPENMP
+#include <omp.h>
+#endif
+
+namespace {
+template <typename T>
+inline float to_float(T val) {
+    if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
+        return llaisys::utils::cast<float>(val);
+    } else {
+        return static_cast<float>(val);
+    }
+}
+
+template <typename T>
+inline T from_float(float val) {
+    if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
+        return llaisys::utils::cast<T>(val);
+    } else {
+        return static_cast<T>(val);
+    }
+}
+} // namespace
+
 template <typename T>
 void linear_(T *out, const T *in, const T *weight, const T *bias, size_t m, size_t n, size_t k) {
-    for (size_t i = 0; i < m; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            float acc = 0.0f;
-            if (bias) {
-                if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
-                    acc = llaisys::utils::cast<float>(bias[j]);
-                } else {
-                    acc = static_cast<float>(bias[j]);
-                }
-            }
-            const T *in_row = in + i * k;
-            const T *w_row = weight + j * k;
-            for (size_t t = 0; t < k; ++t) {
-                float a;
-                float b;
-                if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
-                    a = llaisys::utils::cast<float>(in_row[t]);
-                    b = llaisys::utils::cast<float>(w_row[t]);
-                } else {
-                    a = static_cast<float>(in_row[t]);
-                    b = static_cast<float>(w_row[t]);
-                }
-                acc += a * b;
+    constexpr size_t kBlock = 64;
+    constexpr size_t nBlock = 32;
+
+#ifdef LLAISYS_USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(m); ++i) {
+        const T *in_row = in + static_cast<size_t>(i) * k;
+        T *out_row = out + static_cast<size_t>(i) * n;
+
+        for (size_t j0 = 0; j0 < n; j0 += nBlock) {
+            const size_t j_end = std::min(j0 + nBlock, n);
+            std::array<float, nBlock> acc{};
+
+            for (size_t jj = 0; jj < j_end - j0; ++jj) {
+                acc[jj] = bias ? to_float(bias[j0 + jj]) : 0.0f;
             }
 
-            if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
-                out[i * n + j] = llaisys::utils::cast<T>(acc);
-            } else {
-                out[i * n + j] = static_cast<T>(acc);
+            for (size_t t0 = 0; t0 < k; t0 += kBlock) {
+                const size_t t_end = std::min(t0 + kBlock, k);
+                for (size_t t = t0; t < t_end; ++t) {
+                    const float a = to_float(in_row[t]);
+                    for (size_t j = j0; j < j_end; ++j) {
+                        acc[j - j0] += a * to_float(weight[j * k + t]);
+                    }
+                }
+            }
+
+            for (size_t j = j0; j < j_end; ++j) {
+                out_row[j] = from_float<T>(acc[j - j0]);
             }
         }
     }
