@@ -1,9 +1,14 @@
 #include "op.hpp"
 
+#include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
 #include <cmath>
 #include <type_traits>
+
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/rms_norm_nvidia.cuh"
+#endif
 
 namespace llaisys::ops {
 
@@ -58,24 +63,46 @@ void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
     size_t m = in->shape()[0];
     size_t d = in->shape()[1];
 
-    switch (out->dtype()) {
-    case LLAISYS_DTYPE_F32:
-        return rms_norm_(reinterpret_cast<float *>(out->data()),
-                         reinterpret_cast<const float *>(in->data()),
-                         reinterpret_cast<const float *>(weight->data()),
-                         m, d, eps);
-    case LLAISYS_DTYPE_F16:
-        return rms_norm_(reinterpret_cast<llaisys::fp16_t *>(out->data()),
-                         reinterpret_cast<const llaisys::fp16_t *>(in->data()),
-                         reinterpret_cast<const llaisys::fp16_t *>(weight->data()),
-                         m, d, eps);
-    case LLAISYS_DTYPE_BF16:
-        return rms_norm_(reinterpret_cast<llaisys::bf16_t *>(out->data()),
-                         reinterpret_cast<const llaisys::bf16_t *>(in->data()),
-                         reinterpret_cast<const llaisys::bf16_t *>(weight->data()),
-                         m, d, eps);
-    default:
-        EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+    if (out->deviceType() == LLAISYS_DEVICE_CPU) {
+        switch (out->dtype()) {
+        case LLAISYS_DTYPE_F32:
+            return rms_norm_(reinterpret_cast<float *>(out->data()),
+                             reinterpret_cast<const float *>(in->data()),
+                             reinterpret_cast<const float *>(weight->data()),
+                             m, d, eps);
+        case LLAISYS_DTYPE_F16:
+            return rms_norm_(reinterpret_cast<llaisys::fp16_t *>(out->data()),
+                             reinterpret_cast<const llaisys::fp16_t *>(in->data()),
+                             reinterpret_cast<const llaisys::fp16_t *>(weight->data()),
+                             m, d, eps);
+        case LLAISYS_DTYPE_BF16:
+            return rms_norm_(reinterpret_cast<llaisys::bf16_t *>(out->data()),
+                             reinterpret_cast<const llaisys::bf16_t *>(in->data()),
+                             reinterpret_cast<const llaisys::bf16_t *>(weight->data()),
+                             m, d, eps);
+        default:
+            EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+        }
     }
+
+    llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+#ifdef ENABLE_NVIDIA_API
+        return nvidia::rms_norm(
+            reinterpret_cast<std::byte *>(out->data()),
+            reinterpret_cast<const std::byte *>(in->data()),
+            reinterpret_cast<const std::byte *>(weight->data()),
+            out->dtype(),
+            m,
+            d,
+            eps,
+            llaisys::core::context().runtime().stream());
+#else
+        EXCEPTION_UNSUPPORTED_DEVICE;
+#endif
+    }
+
+    EXCEPTION_UNSUPPORTED_DEVICE;
 }
 } // namespace llaisys::ops
