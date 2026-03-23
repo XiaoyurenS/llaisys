@@ -1,4 +1,4 @@
-from ctypes import POINTER, Structure, c_float, c_int, c_int64, c_size_t, c_void_p
+from ctypes import POINTER, Structure, c_float, c_int, c_int64, c_size_t, c_uint8, c_void_p
 
 from .llaisys_types import llaisysDataType_t, llaisysDeviceType_t
 from .tensor import llaisysTensor_t
@@ -58,6 +58,12 @@ def load_qwen2(lib):
 
     lib.llaisysQwen2ModelWeights.argtypes = [llaisysQwen2Model_t]
     lib.llaisysQwen2ModelWeights.restype = POINTER(LlaisysQwen2Weights)
+
+    lib.llaisysQwen2ModelSetKVCache.argtypes = [llaisysQwen2Model_t, c_uint8]
+    lib.llaisysQwen2ModelSetKVCache.restype = None
+
+    lib.llaisysQwen2ModelResetCache.argtypes = [llaisysQwen2Model_t]
+    lib.llaisysQwen2ModelResetCache.restype = None
 
     lib.llaisysQwen2ModelInfer.argtypes = [
         llaisysQwen2Model_t,

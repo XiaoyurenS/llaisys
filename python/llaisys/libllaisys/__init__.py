@@ -18,21 +18,24 @@ from .qwen2 import load_qwen2
 def load_shared_library():
     lib_dir = Path(__file__).parent
 
+    candidates = []
     if sys.platform.startswith("linux"):
-        libname = "libllaisys.so"
+        candidates = ["libllaisys.so"]
     elif sys.platform == "win32":
-        libname = "llaisys.dll"
+        candidates = ["llaisys.dll"]
     elif sys.platform == "darwin":
-        libname = "llaisys.dylib"
+        candidates = ["libllaisys.dylib", "llaisys.dylib"]
     else:
         raise RuntimeError("Unsupported platform")
 
-    lib_path = os.path.join(lib_dir, libname)
+    for libname in candidates:
+        lib_path = os.path.join(lib_dir, libname)
+        if os.path.isfile(lib_path):
+            return ctypes.CDLL(str(lib_path))
 
-    if not os.path.isfile(lib_path):
-        raise FileNotFoundError(f"Shared library not found: {lib_path}")
-
-    return ctypes.CDLL(str(lib_path))
+    raise FileNotFoundError(
+        f"Shared library not found in {lib_dir}, tried: {', '.join(candidates)}"
+    )
 
 
 LIB_LLAISYS = load_shared_library()

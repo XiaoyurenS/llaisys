@@ -13,10 +13,11 @@ import safetensors
 
 class Qwen2:
 
-    def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
+    def __init__(self, model_path, device: DeviceType = DeviceType.CPU, use_kv_cache: bool = True):
         self._device = device
         self._model: llaisysQwen2Model_t | None = None
         self._end_token = None
+        self._use_kv_cache = use_kv_cache
         print("[LLAISYS] qwen2 python init")
 
         model_path = Path(model_path)
@@ -73,6 +74,7 @@ class Qwen2:
         self._model = LIB_LLAISYS.llaisysQwen2ModelCreate(
             meta, llaisysDeviceType_t(device), None, 0
         )
+        LIB_LLAISYS.llaisysQwen2ModelSetKVCache(self._model, int(use_kv_cache))
 
         weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self._model)
         if not weights_ptr:
@@ -174,6 +176,23 @@ class Qwen2:
             LIB_LLAISYS.llaisysQwen2ModelDestroy(self._model)
             self._model = None
 
+    def set_kv_cache(self, enabled: bool):
+        if self._model is None:
+            raise RuntimeError("Model is not initialized")
+        self._use_kv_cache = enabled
+        LIB_LLAISYS.llaisysQwen2ModelSetKVCache(self._model, int(enabled))
+
+    def reset_cache(self):
+        if self._model is None:
+            raise RuntimeError("Model is not initialized")
+        LIB_LLAISYS.llaisysQwen2ModelResetCache(self._model)
+
+    def infer_next(self, tokens: Sequence[int]) -> int:
+        if self._model is None:
+            raise RuntimeError("Model is not initialized")
+        arr = (ctypes.c_int64 * len(tokens))(*tokens)
+        return int(LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, arr, len(tokens)))
+
     def generate(
         self,
         inputs: Sequence[int],
@@ -189,9 +208,7 @@ class Qwen2:
             max_new_tokens = 1
         tokens = list(inputs)
         for _ in range(max_new_tokens):
-            arr = (ctypes.c_int64 * len(tokens))(*tokens)
-            next_id = LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, arr, len(tokens))
-            next_id = int(next_id)
+            next_id = self.infer_next(tokens)
             tokens.append(next_id)
             if self._end_token is not None and next_id == self._end_token:
                 break

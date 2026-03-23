@@ -8,6 +8,12 @@ from .ops import Ops
 from . import models
 from .models import *
 
+try:
+    from . import models
+    from .models import *
+except ModuleNotFoundError:
+    models = None
+
 __all__ = [
     "RuntimeAPI",
     "DeviceType",

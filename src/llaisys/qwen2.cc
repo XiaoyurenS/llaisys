@@ -26,6 +26,7 @@ struct LlaisysQwen2Model {
     std::vector<llaisys::tensor_t> v_cache;
     size_t cache_len = 0;
     llaisys::tensor_t pos_ids_cache;
+    bool use_kv_cache = true;
 };
 
 static llaisys::tensor_t unwrap(llaisysTensor_t tensor) {
@@ -119,6 +120,23 @@ __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen
     return model ? &model->weights : nullptr;
 }
 
+__export void llaisysQwen2ModelSetKVCache(struct LlaisysQwen2Model *model, uint8_t enabled) {
+    if (!model) {
+        return;
+    }
+    model->use_kv_cache = enabled != 0;
+    if (!model->use_kv_cache) {
+        model->cache_len = 0;
+    }
+}
+
+__export void llaisysQwen2ModelResetCache(struct LlaisysQwen2Model *model) {
+    if (!model) {
+        return;
+    }
+    model->cache_len = 0;
+}
+
 __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
     std::cout << "[LLAISYS] qwen2 infer ntoken=" << ntoken << std::endl;
     if (!model || ntoken == 0 || token_ids == nullptr) {
@@ -131,7 +149,7 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t
 
     int device_id = pick_device_id(model);
 
-    bool use_cache = (model->cache_len > 0 && ntoken == model->cache_len + 1);
+    bool use_cache = model->use_kv_cache && (model->cache_len > 0 && ntoken == model->cache_len + 1);
     if (!use_cache) {
         model->cache_len = 0;
     }
