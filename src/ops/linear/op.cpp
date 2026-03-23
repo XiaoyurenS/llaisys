@@ -1,5 +1,6 @@
 #include "op.hpp"
 
+#include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
 #include <algorithm>
@@ -9,6 +10,10 @@
 
 #ifdef LLAISYS_USE_OPENBLAS
 #include <cblas.h>
+#endif
+
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/linear_nvidia.cuh"
 #endif
 
 namespace llaisys::ops {
@@ -194,27 +199,51 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     if (bias) {
         ASSERT(bias->isContiguous(), "linear: bias must be contiguous.");
     }
-    switch (out->dtype()) {
-    case LLAISYS_DTYPE_F32:
-        return linear_(reinterpret_cast<float *>(out->data()),
-                       reinterpret_cast<const float *>(in->data()),
-                       reinterpret_cast<const float *>(weight->data()),
-                       bias ? reinterpret_cast<const float *>(bias->data()) : nullptr,
-                       m, n, k);
-    case LLAISYS_DTYPE_F16:
-        return linear_(reinterpret_cast<llaisys::fp16_t *>(out->data()),
-                       reinterpret_cast<const llaisys::fp16_t *>(in->data()),
-                       reinterpret_cast<const llaisys::fp16_t *>(weight->data()),
-                       bias ? reinterpret_cast<const llaisys::fp16_t *>(bias->data()) : nullptr,
-                       m, n, k);
-    case LLAISYS_DTYPE_BF16:
-        return linear_(reinterpret_cast<llaisys::bf16_t *>(out->data()),
-                       reinterpret_cast<const llaisys::bf16_t *>(in->data()),
-                       reinterpret_cast<const llaisys::bf16_t *>(weight->data()),
-                       bias ? reinterpret_cast<const llaisys::bf16_t *>(bias->data()) : nullptr,
-                       m, n, k);
-    default:
-        EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+
+    if (out->deviceType() == LLAISYS_DEVICE_CPU) {
+        switch (out->dtype()) {
+        case LLAISYS_DTYPE_F32:
+            return linear_(reinterpret_cast<float *>(out->data()),
+                           reinterpret_cast<const float *>(in->data()),
+                           reinterpret_cast<const float *>(weight->data()),
+                           bias ? reinterpret_cast<const float *>(bias->data()) : nullptr,
+                           m, n, k);
+        case LLAISYS_DTYPE_F16:
+            return linear_(reinterpret_cast<llaisys::fp16_t *>(out->data()),
+                           reinterpret_cast<const llaisys::fp16_t *>(in->data()),
+                           reinterpret_cast<const llaisys::fp16_t *>(weight->data()),
+                           bias ? reinterpret_cast<const llaisys::fp16_t *>(bias->data()) : nullptr,
+                           m, n, k);
+        case LLAISYS_DTYPE_BF16:
+            return linear_(reinterpret_cast<llaisys::bf16_t *>(out->data()),
+                           reinterpret_cast<const llaisys::bf16_t *>(in->data()),
+                           reinterpret_cast<const llaisys::bf16_t *>(weight->data()),
+                           bias ? reinterpret_cast<const llaisys::bf16_t *>(bias->data()) : nullptr,
+                           m, n, k);
+        default:
+            EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+        }
     }
+
+    llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+#ifdef ENABLE_NVIDIA_API
+        return nvidia::linear(
+            reinterpret_cast<std::byte *>(out->data()),
+            reinterpret_cast<const std::byte *>(in->data()),
+            reinterpret_cast<const std::byte *>(weight->data()),
+            bias ? reinterpret_cast<const std::byte *>(bias->data()) : nullptr,
+            out->dtype(),
+            m,
+            n,
+            k,
+            llaisys::core::context().runtime().stream());
+#else
+        EXCEPTION_UNSUPPORTED_DEVICE;
+#endif
+    }
+
+    EXCEPTION_UNSUPPORTED_DEVICE;
 }
 } // namespace llaisys::ops

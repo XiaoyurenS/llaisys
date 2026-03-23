@@ -154,6 +154,7 @@ target("llaisys")
         add_rules("cuda")
         add_values("cuda.build.devlink", true)
         add_syslinks("cudart")
+        add_syslinks("cublas")
         add_cuflags("-cudart=shared")
         add_culdflags("-cudart=shared")
     end
@@ -176,6 +177,7 @@ target("llaisys")
             add_rpathdirs("/usr/local/cuda/lib64")
         end
         add_links("cudart")
+        add_links("cublas")
     end
     add_files("src/llaisys/*.cc")
     if has_config("nv-gpu") then
