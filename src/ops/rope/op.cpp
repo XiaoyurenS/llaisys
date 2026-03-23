@@ -1,9 +1,14 @@
 #include "op.hpp"
 
+#include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
 #include <cmath>
 #include <type_traits>
+
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/rope_nvidia.cuh"
+#endif
 
 namespace llaisys::ops {
 
@@ -56,24 +61,47 @@ void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
     size_t d = in->shape()[2];
     CHECK_ARGUMENT(d % 2 == 0, "rope: last dimension must be even");
 
-    switch (out->dtype()) {
-    case LLAISYS_DTYPE_F32:
-        return rope_(reinterpret_cast<float *>(out->data()),
-                     reinterpret_cast<const float *>(in->data()),
-                     reinterpret_cast<const int64_t *>(pos_ids->data()),
-                     seqlen, nhead, d, theta);
-    case LLAISYS_DTYPE_F16:
-        return rope_(reinterpret_cast<llaisys::fp16_t *>(out->data()),
-                     reinterpret_cast<const llaisys::fp16_t *>(in->data()),
-                     reinterpret_cast<const int64_t *>(pos_ids->data()),
-                     seqlen, nhead, d, theta);
-    case LLAISYS_DTYPE_BF16:
-        return rope_(reinterpret_cast<llaisys::bf16_t *>(out->data()),
-                     reinterpret_cast<const llaisys::bf16_t *>(in->data()),
-                     reinterpret_cast<const int64_t *>(pos_ids->data()),
-                     seqlen, nhead, d, theta);
-    default:
-        EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+    if (out->deviceType() == LLAISYS_DEVICE_CPU) {
+        switch (out->dtype()) {
+        case LLAISYS_DTYPE_F32:
+            return rope_(reinterpret_cast<float *>(out->data()),
+                         reinterpret_cast<const float *>(in->data()),
+                         reinterpret_cast<const int64_t *>(pos_ids->data()),
+                         seqlen, nhead, d, theta);
+        case LLAISYS_DTYPE_F16:
+            return rope_(reinterpret_cast<llaisys::fp16_t *>(out->data()),
+                         reinterpret_cast<const llaisys::fp16_t *>(in->data()),
+                         reinterpret_cast<const int64_t *>(pos_ids->data()),
+                         seqlen, nhead, d, theta);
+        case LLAISYS_DTYPE_BF16:
+            return rope_(reinterpret_cast<llaisys::bf16_t *>(out->data()),
+                         reinterpret_cast<const llaisys::bf16_t *>(in->data()),
+                         reinterpret_cast<const int64_t *>(pos_ids->data()),
+                         seqlen, nhead, d, theta);
+        default:
+            EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+        }
     }
+
+    llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+#ifdef ENABLE_NVIDIA_API
+        return nvidia::rope(
+            reinterpret_cast<std::byte *>(out->data()),
+            reinterpret_cast<const std::byte *>(in->data()),
+            reinterpret_cast<const int64_t *>(pos_ids->data()),
+            out->dtype(),
+            seqlen,
+            nhead,
+            d,
+            theta,
+            llaisys::core::context().runtime().stream());
+#else
+        EXCEPTION_UNSUPPORTED_DEVICE;
+#endif
+    }
+
+    EXCEPTION_UNSUPPORTED_DEVICE;
 }
 } // namespace llaisys::ops
