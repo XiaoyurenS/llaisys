@@ -296,8 +296,6 @@ tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
         : this->contiguous();
 
     auto dst = Tensor::create(this->shape(), this->dtype(), device_type, target_device);
-
-    core::context().setDevice(device_type, target_device);
     size_t bytes = src->numel() * src->elementSize();
 
     if (src->deviceType() == LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
@@ -312,6 +310,19 @@ tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
         kind = LLAISYS_MEMCPY_D2H;
     }
 
+    // 对 H2D / D2H 拷贝，必须由“持有 device 指针”的 runtime 发起。
+    // 否则会出现 CPU runtime 直接 std::memcpy GPU 地址，导致段错误。
+    if (kind == LLAISYS_MEMCPY_H2D || kind == LLAISYS_MEMCPY_D2D) {
+        core::context().setDevice(device_type, target_device);
+        core::context().runtime().api()->memcpy_sync(
+            dst->data(),
+            src->data(),
+            bytes,
+            kind);
+        return dst;
+    }
+
+    core::context().setDevice(src->deviceType(), src->deviceId());
     core::context().runtime().api()->memcpy_sync(
         dst->data(),
         src->data(),
