@@ -9,6 +9,24 @@ option("cpu-openmp")
     set_description("Whether to enable OpenMP for CPU operators")
 option_end()
 
+option("cpu-openblas")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to enable OpenBLAS-backed CPU linear")
+option_end()
+
+option("openblas-incdir")
+    set_default("")
+    set_showmenu(true)
+    set_description("OpenBLAS include directory")
+option_end()
+
+option("openblas-linkdir")
+    set_default("")
+    set_showmenu(true)
+    set_description("OpenBLAS library directory")
+option_end()
+
 -- CPU --
 includes("xmake/cpu.lua")
 
@@ -100,6 +118,13 @@ target("llaisys-ops")
         add_ldflags("-fopenmp")
         add_defines("LLAISYS_USE_OPENMP")
     end
+    if has_config("cpu-openblas") then
+        add_defines("LLAISYS_USE_OPENBLAS")
+        local incdir = get_config("openblas-incdir")
+        if incdir ~= nil and incdir ~= "" then
+            add_includedirs(incdir)
+        end
+    end
     
     add_files("src/ops/*/*.cpp")
 
@@ -119,6 +144,15 @@ target("llaisys")
     if has_config("cpu-openmp") and not is_plat("windows") then
         add_ldflags("-fopenmp")
     end
+    if has_config("cpu-openblas") then
+        local linkdir = get_config("openblas-linkdir")
+        if linkdir ~= nil and linkdir ~= "" then
+            add_linkdirs(linkdir)
+        end
+        if is_plat("linux") then
+            add_ldflags("-Wl,--no-as-needed")
+        end
+    end
     add_files("src/llaisys/*.cc")
     set_installdir(".")
 
@@ -136,4 +170,8 @@ target("llaisys")
             os.cp("lib/*.dylib", "python/llaisys/libllaisys/")
         end
     end)
+
+    if has_config("cpu-openblas") then
+        add_syslinks("openblas")
+    end
 target_end()

@@ -5,6 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <type_traits>
+#include <vector>
+
+#ifdef LLAISYS_USE_OPENBLAS
+#include <cblas.h>
+#endif
 
 namespace llaisys::ops {
 
@@ -32,8 +37,101 @@ inline T from_float(float val) {
 }
 } // namespace
 
+#ifdef LLAISYS_USE_OPENBLAS
+inline bool should_use_blas(size_t m, size_t n, size_t k) {
+    const size_t work = m * n * k;
+    if (m <= 4) {
+        return false;
+    }
+    return work >= (size_t(1) << 20);
+}
+
+void linear_blas_f32(float *out, const float *in, const float *weight, const float *bias, size_t m, size_t n, size_t k) {
+    cblas_sgemm(
+        CblasRowMajor,
+        CblasNoTrans,
+        CblasTrans,
+        static_cast<int>(m),
+        static_cast<int>(n),
+        static_cast<int>(k),
+        1.0f,
+        in,
+        static_cast<int>(k),
+        weight,
+        static_cast<int>(k),
+        0.0f,
+        out,
+        static_cast<int>(n));
+
+    if (bias != nullptr) {
+#ifdef LLAISYS_USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(m); ++i) {
+            float *out_row = out + static_cast<size_t>(i) * n;
+            for (size_t j = 0; j < n; ++j) {
+                out_row[j] += bias[j];
+            }
+        }
+    }
+}
+
+template <typename T>
+void linear_blas_casted(T *out, const T *in, const T *weight, const T *bias, size_t m, size_t n, size_t k) {
+    std::vector<float> in_f(m * k);
+    std::vector<float> w_f(n * k);
+    std::vector<float> out_f(m * n);
+    std::vector<float> bias_f;
+
+#ifdef LLAISYS_USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(m * k); ++idx) {
+        in_f[static_cast<size_t>(idx)] = to_float(in[static_cast<size_t>(idx)]);
+    }
+
+#ifdef LLAISYS_USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(n * k); ++idx) {
+        w_f[static_cast<size_t>(idx)] = to_float(weight[static_cast<size_t>(idx)]);
+    }
+
+    const float *bias_ptr = nullptr;
+    if (bias != nullptr) {
+        bias_f.resize(n);
+#ifdef LLAISYS_USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (ptrdiff_t j = 0; j < static_cast<ptrdiff_t>(n); ++j) {
+            bias_f[static_cast<size_t>(j)] = to_float(bias[static_cast<size_t>(j)]);
+        }
+        bias_ptr = bias_f.data();
+    }
+
+    linear_blas_f32(out_f.data(), in_f.data(), w_f.data(), bias_ptr, m, n, k);
+
+#ifdef LLAISYS_USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(m * n); ++idx) {
+        out[static_cast<size_t>(idx)] = from_float<T>(out_f[static_cast<size_t>(idx)]);
+    }
+}
+#endif
+
 template <typename T>
 void linear_(T *out, const T *in, const T *weight, const T *bias, size_t m, size_t n, size_t k) {
+#ifdef LLAISYS_USE_OPENBLAS
+    if (should_use_blas(m, n, k)) {
+        if constexpr (std::is_same_v<T, float>) {
+            return linear_blas_f32(out, in, weight, bias, m, n, k);
+        } else {
+            return linear_blas_casted(out, in, weight, bias, m, n, k);
+        }
+    }
+#endif
+
     constexpr size_t kBlock = 64;
     constexpr size_t nBlock = 32;
 
