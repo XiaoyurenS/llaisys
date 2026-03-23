@@ -16,9 +16,8 @@ inline void check_cuda(cudaError_t status, const char *what) {
 }
 
 template <typename T>
-__global__ void embedding_kernel(T *out, const int64_t *index, const T *weight, size_t vocab, size_t dim) {
+__global__ void embedding_kernel(T *out, const int64_t *index, const T *weight, size_t vocab, size_t dim, size_t total) {
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total = gridDim.y * dim;
     if (idx >= total) {
         return;
     }
@@ -39,7 +38,7 @@ void launch_embedding(T *out, const int64_t *index, const T *weight, size_t n, s
     constexpr int threads = 256;
     const size_t total = n * dim;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
-    embedding_kernel<<<blocks, threads, 0, stream>>>(out, index, weight, vocab, dim);
+    embedding_kernel<<<blocks, threads, 0, stream>>>(out, index, weight, vocab, dim, total);
     check_cuda(cudaGetLastError(), "CUDA embedding kernel launch failed");
 }
 } // namespace
