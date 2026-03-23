@@ -61,6 +61,10 @@ target("llaisys-device")
     set_kind("static")
     add_deps("llaisys-utils")
     add_deps("llaisys-device-cpu")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-device-nvidia")
+        add_defines("ENABLE_NVIDIA_API")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -107,6 +111,10 @@ target_end()
 target("llaisys-ops")
     set_kind("static")
     add_deps("llaisys-ops-cpu")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-ops-nvidia")
+        add_defines("ENABLE_NVIDIA_API")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -141,6 +149,14 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    if has_config("nv-gpu") then
+        add_defines("ENABLE_NVIDIA_API")
+        add_rules("cuda")
+        add_values("cuda.build.devlink", true)
+        add_syslinks("cudart")
+        add_cuflags("-cudart=shared")
+        add_culdflags("-cudart=shared")
+    end
     if has_config("cpu-openmp") and not is_plat("windows") then
         add_ldflags("-fopenmp")
     end
@@ -153,7 +169,20 @@ target("llaisys")
             add_ldflags("-Wl,--no-as-needed")
         end
     end
+    if has_config("nv-gpu") then
+        -- 显式链接动态 CUDA runtime，避免最终 so 在不同环境下隐式落到不一致的 cudart。
+        add_linkdirs("/usr/local/cuda/lib64")
+        if is_plat("linux") then
+            add_rpathdirs("/usr/local/cuda/lib64")
+        end
+        add_links("cudart")
+    end
     add_files("src/llaisys/*.cc")
+    if has_config("nv-gpu") then
+        -- 这个空的 .cu 文件用于触发最终 shared library 的 CUDA device link。
+        -- 否则来自静态库的 device code 只编译不注册链接，运行时会报 __cudaRegisterLinkedBinary 未定义。
+        add_files("src/llaisys/cuda_stub.cu")
+    end
     set_installdir(".")
 
     
