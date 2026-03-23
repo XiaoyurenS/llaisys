@@ -1,6 +1,12 @@
 #include "op.hpp"
 
+#include "../../core/llaisys_core.hpp"
+
 #include <cstring>
+
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/rearrange_nvidia.cuh"
+#endif
 
 namespace llaisys::ops {
 void rearrange(tensor_t out, tensor_t in) {
@@ -17,9 +23,29 @@ void rearrange(tensor_t out, tensor_t in) {
     }
 
     if (out->isContiguous() && in->isContiguous()) {
-        std::memcpy(out->data(), in->data(), total * elem_size);
+        if (out->deviceType() == LLAISYS_DEVICE_CPU) {
+            std::memcpy(out->data(), in->data(), total * elem_size);
+            return;
+        }
+
+        llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+        if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+#ifdef ENABLE_NVIDIA_API
+            return nvidia::rearrange_contiguous(
+                out->data(),
+                in->data(),
+                total * elem_size,
+                llaisys::core::context().runtime().stream());
+#else
+            EXCEPTION_UNSUPPORTED_DEVICE;
+#endif
+        }
+        EXCEPTION_UNSUPPORTED_DEVICE;
         return;
     }
+
+    CHECK_ARGUMENT(out->deviceType() == LLAISYS_DEVICE_CPU,
+                   "rearrange: non-contiguous NVIDIA path is not implemented yet");
 
     std::vector<size_t> idx(ndim, 0);
     const auto &shape = out->shape();

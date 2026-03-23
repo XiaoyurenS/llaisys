@@ -1,8 +1,13 @@
 #include "op.hpp"
 
+#include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
 #include <cstring>
+
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/embedding_nvidia.cuh"
+#endif
 
 namespace llaisys::ops {
 void embedding(tensor_t out, tensor_t index, tensor_t weight) {
@@ -22,16 +27,39 @@ void embedding(tensor_t out, tensor_t index, tensor_t weight) {
     size_t dim = weight->shape()[1];
     size_t elem_size = out->elementSize();
 
-    const std::byte *w_ptr = weight->data();
-    std::byte *o_ptr = out->data();
+    if (out->deviceType() == LLAISYS_DEVICE_CPU) {
+        const std::byte *w_ptr = weight->data();
+        std::byte *o_ptr = out->data();
 
-    for (size_t i = 0; i < n; ++i) {
-        int64_t row = idx_ptr[i];
-        CHECK_ARGUMENT(row >= 0 && static_cast<size_t>(row) < weight->shape()[0],
-                       "embedding: index out of range");
-        const std::byte *src = w_ptr + static_cast<size_t>(row) * dim * elem_size;
-        std::byte *dst = o_ptr + i * dim * elem_size;
-        std::memcpy(dst, src, dim * elem_size);
+        for (size_t i = 0; i < n; ++i) {
+            int64_t row = idx_ptr[i];
+            CHECK_ARGUMENT(row >= 0 && static_cast<size_t>(row) < weight->shape()[0],
+                           "embedding: index out of range");
+            const std::byte *src = w_ptr + static_cast<size_t>(row) * dim * elem_size;
+            std::byte *dst = o_ptr + i * dim * elem_size;
+            std::memcpy(dst, src, dim * elem_size);
+        }
+        return;
     }
+
+    llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+
+    if (out->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+#ifdef ENABLE_NVIDIA_API
+        return nvidia::embedding(
+            out->data(),
+            reinterpret_cast<const int64_t *>(index->data()),
+            weight->data(),
+            out->dtype(),
+            n,
+            weight->shape()[0],
+            dim,
+            llaisys::core::context().runtime().stream());
+#else
+        EXCEPTION_UNSUPPORTED_DEVICE;
+#endif
+    }
+
+    EXCEPTION_UNSUPPORTED_DEVICE;
 }
 } // namespace llaisys::ops
