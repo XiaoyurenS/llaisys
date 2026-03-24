@@ -47,11 +47,12 @@ __global__ void self_attention_kernel(
     size_t nkvhead,
     size_t dv,
     float scale) {
-    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t idx = static_cast<size_t>(blockIdx.x);
     const size_t total_queries = seqlen * nhead;
     if (idx >= total_queries) {
         return;
     }
+    const size_t tid = static_cast<size_t>(threadIdx.x);
 
     const size_t i = idx / nhead;
     const size_t h = idx % nhead;
@@ -70,47 +71,47 @@ __global__ void self_attention_kernel(
 
     const size_t q_base = (i * nhead + h) * d;
     const size_t out_base = (i * nhead + h) * dv;
+    extern __shared__ float scores[];
 
-    // 先扫描一遍 attention score，找 softmax 所需的最大值。
-    float max_score = -1.0e30f;
-    for (size_t t = 0; t <= max_t; ++t) {
+    // 每个线程负责一部分 t，先并行算出 attention score 并写入 shared memory。
+    for (size_t t = tid; t <= max_t; t += blockDim.x) {
         const size_t k_base = (t * nkvhead + kvh) * d;
         float score = 0.0f;
         for (size_t j = 0; j < d; ++j) {
             score += to_float(q[q_base + j]) * to_float(k[k_base + j]);
         }
-        score *= scale;
-        if (score > max_score) {
-            max_score = score;
+        scores[t] = score * scale;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        // softmax 仍然由单线程完成，但前面最重的 qk 打分已经并行化了。
+        float max_score = -1.0e30f;
+        for (size_t t = 0; t <= max_t; ++t) {
+            if (scores[t] > max_score) {
+                max_score = scores[t];
+            }
+        }
+
+        float sum = 0.0f;
+        for (size_t t = 0; t <= max_t; ++t) {
+            scores[t] = expf(scores[t] - max_score);
+            sum += scores[t];
+        }
+
+        const float inv_sum = (sum == 0.0f) ? 0.0f : (1.0f / sum);
+        for (size_t t = 0; t <= max_t; ++t) {
+            scores[t] *= inv_sum;
         }
     }
+    __syncthreads();
 
-    // 第二遍算 softmax 分母，避免在 device 端额外开一块 score buffer。
-    float sum = 0.0f;
-    for (size_t t = 0; t <= max_t; ++t) {
-        const size_t k_base = (t * nkvhead + kvh) * d;
-        float score = 0.0f;
-        for (size_t j = 0; j < d; ++j) {
-            score += to_float(q[q_base + j]) * to_float(k[k_base + j]);
-        }
-        score *= scale;
-        sum += expf(score - max_score);
-    }
-    const float inv_sum = (sum == 0.0f) ? 0.0f : (1.0f / sum);
-
-    // 第三遍做对 V 的加权求和，得到当前 (token, head) 的输出。
-    for (size_t j = 0; j < dv; ++j) {
+    // 输出维度再在线程间分摊，每个线程负责若干个 dv 位置。
+    for (size_t j = tid; j < dv; j += blockDim.x) {
         float acc = 0.0f;
         for (size_t t = 0; t <= max_t; ++t) {
-            const size_t k_base = (t * nkvhead + kvh) * d;
             const size_t v_base = (t * nkvhead + kvh) * dv;
-            float score = 0.0f;
-            for (size_t x = 0; x < d; ++x) {
-                score += to_float(q[q_base + x]) * to_float(k[k_base + x]);
-            }
-            score *= scale;
-            const float weight = expf(score - max_score) * inv_sum;
-            acc += weight * to_float(v[v_base + j]);
+            acc += scores[t] * to_float(v[v_base + j]);
         }
         out[out_base + j] = from_float<T>(acc);
     }
@@ -132,8 +133,9 @@ void launch_self_attention(
     cudaStream_t stream) {
     constexpr int threads = 128;
     const size_t total_queries = seqlen * nhead;
-    const int blocks = static_cast<int>((total_queries + threads - 1) / threads);
-    self_attention_kernel<<<blocks, threads, 0, stream>>>(
+    const int blocks = static_cast<int>(total_queries);
+    const size_t shared_bytes = total_len * sizeof(float);
+    self_attention_kernel<<<blocks, threads, shared_bytes, stream>>>(
         out, q, k, v, seqlen, nhead, d, total_len, nkvhead, dv, scale);
     check_cuda(cudaGetLastError(), "CUDA self_attention kernel launch failed");
 }
