@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 
@@ -22,6 +23,24 @@ inline void check_cublas(cublasStatus_t status, const char *what) {
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(std::string(what) + ": cuBLAS status=" + std::to_string(static_cast<int>(status)));
     }
+}
+
+inline cublasHandle_t get_cublas_handle(cudaStream_t stream) {
+    thread_local std::unordered_map<int, cublasHandle_t> handles;
+
+    int device_id = 0;
+    check_cuda(cudaGetDevice(&device_id), "cudaGetDevice failed");
+
+    auto it = handles.find(device_id);
+    if (it == handles.end()) {
+        cublasHandle_t handle = nullptr;
+        check_cublas(cublasCreate(&handle), "cublasCreate failed");
+        it = handles.emplace(device_id, handle).first;
+    }
+
+    // handle 在 device 维度复用，但 stream 每次调用都要重新绑定到当前 runtime 的 stream。
+    check_cublas(cublasSetStream(it->second, stream), "cublasSetStream failed");
+    return it->second;
 }
 
 __device__ inline float to_float(float v) {
@@ -94,9 +113,7 @@ void linear_f32(
     size_t n,
     size_t k,
     cudaStream_t stream) {
-    cublasHandle_t handle = nullptr;
-    check_cublas(cublasCreate(&handle), "cublasCreate failed");
-    check_cublas(cublasSetStream(handle, stream), "cublasSetStream failed");
+    cublasHandle_t handle = get_cublas_handle(stream);
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -122,7 +139,6 @@ void linear_f32(
         "cublasSgemm failed");
 
     launch_bias_add(out, bias, m, n, stream);
-    check_cublas(cublasDestroy(handle), "cublasDestroy failed");
 }
 
 template <typename T>
@@ -136,9 +152,7 @@ void linear_gemm_ex(
     size_t k,
     cudaDataType_t data_type,
     cudaStream_t stream) {
-    cublasHandle_t handle = nullptr;
-    check_cublas(cublasCreate(&handle), "cublasCreate failed");
-    check_cublas(cublasSetStream(handle, stream), "cublasSetStream failed");
+    cublasHandle_t handle = get_cublas_handle(stream);
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -168,7 +182,6 @@ void linear_gemm_ex(
         "cublasGemmEx failed");
 
     launch_bias_add(out, bias, m, n, stream);
-    check_cublas(cublasDestroy(handle), "cublasDestroy failed");
 }
 } // namespace
 
