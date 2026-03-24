@@ -42,5 +42,7 @@ __C {
     __export void llaisysQwen2ModelResetCache(struct LlaisysQwen2Model * model);
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+
+    __export size_t llaisysQwen2ModelGenerate(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, size_t max_new_tokens, size_t capacity);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

@@ -39,6 +39,7 @@ option_end()
 
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
+    add_includedirs("/usr/local/cuda/include")
     includes("xmake/nvidia.lua")
 end
 
@@ -155,6 +156,7 @@ target("llaisys")
         add_values("cuda.build.devlink", true)
         add_syslinks("cudart")
         add_syslinks("cublas")
+        add_syslinks("nvToolsExt")
         add_cuflags("-cudart=shared")
         add_culdflags("-cudart=shared")
     end
@@ -178,6 +180,7 @@ target("llaisys")
         end
         add_links("cudart")
         add_links("cublas")
+        add_links("nvToolsExt")
     end
     add_files("src/llaisys/*.cc")
     if has_config("nv-gpu") then

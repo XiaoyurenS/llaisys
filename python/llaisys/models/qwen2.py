@@ -206,10 +206,20 @@ class Qwen2:
             raise RuntimeError("Model is not initialized")
         if max_new_tokens is None:
             max_new_tokens = 1
-        tokens = list(inputs)
-        for _ in range(max_new_tokens):
-            next_id = self.infer_next(tokens)
-            tokens.append(next_id)
-            if self._end_token is not None and next_id == self._end_token:
-                break
-        return tokens
+        tokens = [int(x) for x in inputs]
+        capacity = len(tokens) + max_new_tokens
+        buf = (ctypes.c_int64 * max(1, capacity))()
+        for i, token in enumerate(tokens):
+            buf[i] = token
+
+        # generate 走 backend-side 循环，减少 Python/ctypes 在每个 token 上的往返开销。
+        total = int(LIB_LLAISYS.llaisysQwen2ModelGenerate(
+            self._model,
+            buf,
+            len(tokens),
+            max_new_tokens,
+            capacity,
+        ))
+        if total <= 0:
+            raise RuntimeError("Backend generate failed")
+        return [int(buf[i]) for i in range(total)]
