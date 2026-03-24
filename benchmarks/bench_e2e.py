@@ -4,6 +4,7 @@ import argparse
 
 from common import (
     build_prompt_ids,
+    measure_llaisys_generate,
     load_tokenizer,
     load_torch_model,
     measure_llaisys_decode,
@@ -24,6 +25,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--skip-pytorch", action="store_true")
+    parser.add_argument("--llaisys-mode", choices=["decode", "generate"], default="decode")
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -42,7 +44,10 @@ def main():
             systems = []
             if torch_model is not None:
                 systems.append(("PyTorch", lambda: measure_pytorch_decode(torch_model, prompt_ids, new_tokens, args.device)))
-            systems.append(("LLAISYS", lambda: measure_llaisys_decode(llaisys_model, prompt_ids, new_tokens, args.device)))
+            if args.llaisys_mode == "generate":
+                systems.append(("LLAISYS", lambda: measure_llaisys_generate(llaisys_model, prompt_ids, new_tokens, args.device)))
+            else:
+                systems.append(("LLAISYS", lambda: measure_llaisys_decode(llaisys_model, prompt_ids, new_tokens, args.device)))
 
             for name, fn in systems:
                 for _ in range(args.warmup):
@@ -50,37 +55,58 @@ def main():
 
                 ttft_samples: list[float] = []
                 decode_samples: list[float] = []
+                total_ms_samples: list[float] = []
                 e2e_samples: list[float] = []
                 throughput_samples: list[float] = []
 
                 for _ in range(args.repeat):
                     _, timings = fn()
-                    ttft = timings[0]
-                    decode = sum(timings[1:]) / max(1, len(timings) - 1)
-                    e2e = sum(timings)
+                    if name == "LLAISYS" and args.llaisys_mode == "generate":
+                        e2e = timings[0]
+                        ttft = None
+                        decode = e2e / max(1, new_tokens)
+                        total_ms_samples.append(e2e)
+                    else:
+                        ttft = timings[0]
+                        decode = sum(timings[1:]) / max(1, len(timings) - 1)
+                        e2e = sum(timings)
                     throughput = (new_tokens * 1000.0) / e2e
-                    ttft_samples.append(ttft)
+                    if ttft is not None:
+                        ttft_samples.append(ttft)
                     decode_samples.append(decode)
                     e2e_samples.append(e2e / 1000.0)
                     throughput_samples.append(throughput)
 
-                ttft_stat = summarize(ttft_samples)
                 decode_stat = summarize(decode_samples)
                 e2e_stat = summarize(e2e_samples)
                 throughput_stat = summarize(throughput_samples)
 
-                row = {
+                row: dict[str, object] = {
                     "system": name,
                     "device": args.device,
+                    "llaisys_mode": args.llaisys_mode if name == "LLAISYS" else "",
                     "prompt_len": prompt_len,
                     "new_tokens": new_tokens,
-                    "ttft_ms_mean": round(ttft_stat["mean"], 3),
-                    "ttft_ms_median": round(ttft_stat["median"], 3),
-                    "decode_ms_per_token_mean": round(decode_stat["mean"], 3),
-                    "decode_ms_per_token_p95": round(decode_stat["p95"], 3),
                     "e2e_s_mean": round(e2e_stat["mean"], 4),
                     "throughput_tok_s_mean": round(throughput_stat["mean"], 3),
                 }
+
+                if name == "LLAISYS" and args.llaisys_mode == "generate":
+                    total_ms_stat = summarize(total_ms_samples)
+                    row.update({
+                        "total_ms_mean": round(total_ms_stat["mean"], 3),
+                        "total_ms_median": round(total_ms_stat["median"], 3),
+                        "avg_ms_per_token_mean": round(decode_stat["mean"], 3),
+                        "avg_ms_per_token_p95": round(decode_stat["p95"], 3),
+                    })
+                else:
+                    ttft_stat = summarize(ttft_samples)
+                    row.update({
+                        "ttft_ms_mean": round(ttft_stat["mean"], 3),
+                        "ttft_ms_median": round(ttft_stat["median"], 3),
+                        "decode_ms_per_token_mean": round(decode_stat["mean"], 3),
+                        "decode_ms_per_token_p95": round(decode_stat["p95"], 3),
+                    })
                 rows.append(row)
                 print(row)
 

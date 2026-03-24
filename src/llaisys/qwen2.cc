@@ -23,6 +23,7 @@
 namespace {
 struct Qwen2Workspace {
     size_t capacity = 0;
+    size_t token_capacity = 0;
     llaisys::tensor_t index;
     llaisys::tensor_t x;
     llaisys::tensor_t attn_norm;
@@ -44,6 +45,7 @@ struct Qwen2Workspace {
     llaisys::tensor_t max_idx;
     llaisys::tensor_t max_val;
     llaisys::tensor_t max_idx_host;
+    llaisys::tensor_t generated_ids;
 };
 
 struct NvtxRange {
@@ -139,6 +141,164 @@ static void ensure_workspace(LlaisysQwen2Model *model, size_t cur_len, int devic
     model->workspace.logits = llaisys::Tensor::create({1, model->meta.voc}, dtype, device, device_id);
     model->workspace.max_idx = llaisys::Tensor::create({1}, LLAISYS_DTYPE_I64, device, device_id);
     model->workspace.max_val = llaisys::Tensor::create({1}, dtype, device, device_id);
+}
+
+static void ensure_token_workspace(LlaisysQwen2Model *model, size_t capacity, int device_id) {
+    if (model->workspace.token_capacity >= capacity) {
+        return;
+    }
+    model->workspace.token_capacity = capacity;
+    model->workspace.generated_ids = llaisys::Tensor::create(
+        {capacity}, LLAISYS_DTYPE_I64, model->device, device_id);
+}
+
+static int64_t copy_token_to_host(LlaisysQwen2Model *model, llaisys::tensor_t token, int device_id) {
+    if (token->deviceType() == LLAISYS_DEVICE_CPU) {
+        return reinterpret_cast<const int64_t *>(token->data())[0];
+    }
+
+    if (!model->workspace.max_idx_host) {
+        // 复用一个常驻的 pinned host buffer，避免每个 decode step 都重新申请/释放 host staging。
+        llaisys::core::context().setDevice(model->device, device_id);
+        model->workspace.max_idx_host = llaisys::Tensor::create({1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
+    }
+
+    llaisys::core::context().setDevice(token->deviceType(), token->deviceId());
+    llaisys::core::context().runtime().api()->memcpy_sync(
+        model->workspace.max_idx_host->data(),
+        token->data(),
+        sizeof(int64_t),
+        LLAISYS_MEMCPY_D2H);
+    return reinterpret_cast<const int64_t *>(model->workspace.max_idx_host->data())[0];
+}
+
+static llaisys::tensor_t qwen2_forward(
+    LlaisysQwen2Model *model,
+    llaisys::tensor_t index,
+    size_t ntoken,
+    size_t cur_len,
+    size_t pos_start,
+    bool use_cache,
+    int device_id) {
+    const bool enable_nvtx = model->device == LLAISYS_DEVICE_NVIDIA;
+    ensure_workspace(model, cur_len, device_id);
+
+    NvtxRange infer_range(use_cache ? "llaisys_decode" : "llaisys_prefill", enable_nvtx);
+
+    auto x = model->workspace.x->slice(0, 0, cur_len);
+    {
+        NvtxRange range("embedding", enable_nvtx);
+        llaisys::ops::embedding(x, index, unwrap(model->weights.in_embed));
+    }
+
+    if (!model->pos_ids_cache) {
+        model->pos_ids_cache = llaisys::Tensor::create({model->meta.maxseq}, LLAISYS_DTYPE_I64, model->device, device_id);
+        std::vector<int64_t> full_pos(model->meta.maxseq);
+        for (size_t i = 0; i < model->meta.maxseq; ++i) {
+            full_pos[i] = static_cast<int64_t>(i);
+        }
+        model->pos_ids_cache->load(full_pos.data());
+    }
+    auto pos_ids = model->pos_ids_cache->slice(0, pos_start, pos_start + cur_len);
+
+    auto x_cur = x;
+    auto attn_norm = model->workspace.attn_norm->slice(0, 0, cur_len);
+    auto q2d = model->workspace.q2d->slice(0, 0, cur_len);
+    auto k2d = model->workspace.k2d->slice(0, 0, cur_len);
+    auto v2d = model->workspace.v2d->slice(0, 0, cur_len);
+    auto q_rope = model->workspace.q_rope->slice(0, 0, cur_len);
+    auto k_rope = model->workspace.k_rope->slice(0, 0, cur_len);
+    auto attn = model->workspace.attn->slice(0, 0, cur_len);
+    auto attn_out = model->workspace.attn_out->slice(0, 0, cur_len);
+    auto x_attn = model->workspace.x_attn->slice(0, 0, cur_len);
+    auto mlp_norm = model->workspace.mlp_norm->slice(0, 0, cur_len);
+    auto gate = model->workspace.gate->slice(0, 0, cur_len);
+    auto up = model->workspace.up->slice(0, 0, cur_len);
+    auto hidden = model->workspace.hidden->slice(0, 0, cur_len);
+    auto mlp_out = model->workspace.mlp_out->slice(0, 0, cur_len);
+
+    for (size_t layer = 0; layer < model->meta.nlayer; ++layer) {
+        {
+            NvtxRange range("layer_attn", enable_nvtx);
+            llaisys::ops::rms_norm(attn_norm, x_cur, unwrap(model->weights.attn_norm_w[layer]), model->meta.epsilon);
+            llaisys::ops::linear(q2d, attn_norm, unwrap(model->weights.attn_q_w[layer]),
+                                 model->weights.attn_q_b ? unwrap(model->weights.attn_q_b[layer]) : nullptr);
+            llaisys::ops::linear(k2d, attn_norm, unwrap(model->weights.attn_k_w[layer]),
+                                 model->weights.attn_k_b ? unwrap(model->weights.attn_k_b[layer]) : nullptr);
+            llaisys::ops::linear(v2d, attn_norm, unwrap(model->weights.attn_v_w[layer]),
+                                 model->weights.attn_v_b ? unwrap(model->weights.attn_v_b[layer]) : nullptr);
+
+            auto q = q2d->view({cur_len, model->meta.nh, model->meta.dh});
+            auto k = k2d->view({cur_len, model->meta.nkvh, model->meta.dh});
+            auto v = v2d->view({cur_len, model->meta.nkvh, model->meta.dh});
+
+            llaisys::ops::rope(q_rope, q, pos_ids, model->meta.theta);
+            llaisys::ops::rope(k_rope, k, pos_ids, model->meta.theta);
+
+            if (!model->k_cache[layer]) {
+                model->k_cache[layer] = llaisys::Tensor::create(
+                    {model->meta.maxseq, model->meta.nkvh, model->meta.dh},
+                    model->meta.dtype, model->device, device_id);
+                model->v_cache[layer] = llaisys::Tensor::create(
+                    {model->meta.maxseq, model->meta.nkvh, model->meta.dh},
+                    model->meta.dtype, model->device, device_id);
+            }
+
+            if (use_cache) {
+                auto k_dst = model->k_cache[layer]->slice(0, pos_start, pos_start + cur_len);
+                auto v_dst = model->v_cache[layer]->slice(0, pos_start, pos_start + cur_len);
+                llaisys::ops::rearrange(k_dst, k_rope);
+                llaisys::ops::rearrange(v_dst, v);
+            } else {
+                auto k_dst = model->k_cache[layer]->slice(0, 0, ntoken);
+                auto v_dst = model->v_cache[layer]->slice(0, 0, ntoken);
+                llaisys::ops::rearrange(k_dst, k_rope);
+                llaisys::ops::rearrange(v_dst, v);
+            }
+
+            const size_t total_len = use_cache ? (model->cache_len + cur_len) : ntoken;
+            auto k_all = model->k_cache[layer]->slice(0, 0, total_len);
+            auto v_all = model->v_cache[layer]->slice(0, 0, total_len);
+
+            const float scale = 1.0f / std::sqrt(static_cast<float>(model->meta.dh));
+            llaisys::ops::self_attention(attn, q_rope, k_all, v_all, scale);
+
+            auto attn2d = attn->view({cur_len, model->meta.hs});
+            llaisys::ops::linear(attn_out, attn2d, unwrap(model->weights.attn_o_w[layer]), nullptr);
+            llaisys::ops::add(x_attn, x_cur, attn_out);
+        }
+
+        {
+            NvtxRange range("layer_mlp", enable_nvtx);
+            llaisys::ops::rms_norm(mlp_norm, x_attn, unwrap(model->weights.mlp_norm_w[layer]), model->meta.epsilon);
+            llaisys::ops::linear(gate, mlp_norm, unwrap(model->weights.mlp_gate_w[layer]), nullptr);
+            llaisys::ops::linear(up, mlp_norm, unwrap(model->weights.mlp_up_w[layer]), nullptr);
+            llaisys::ops::swiglu(hidden, gate, up);
+            llaisys::ops::linear(mlp_out, hidden, unwrap(model->weights.mlp_down_w[layer]), nullptr);
+            llaisys::ops::add(x_cur, x_attn, mlp_out);
+        }
+    }
+
+    if (!use_cache) {
+        model->cache_len = ntoken;
+    } else {
+        model->cache_len += cur_len;
+    }
+
+    auto normed = model->workspace.normed->slice(0, 0, cur_len);
+    {
+        NvtxRange range("lm_head", enable_nvtx);
+        llaisys::ops::rms_norm(normed, x_cur, unwrap(model->weights.out_norm_w), model->meta.epsilon);
+        auto last_normed = normed->slice(0, cur_len - 1, cur_len);
+        auto logits = model->workspace.logits;
+        llaisys::ops::linear(logits, last_normed, unwrap(model->weights.out_embed), nullptr);
+
+        auto logits_view = logits->view({model->meta.voc});
+        auto max_idx = model->workspace.max_idx;
+        auto max_val = model->workspace.max_val;
+        llaisys::ops::argmax(max_idx, max_val, logits_view);
+        return max_idx;
+    }
 }
 
 __C {
@@ -237,8 +397,6 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t
     }
 
     const int device_id = pick_device_id(model);
-    const bool enable_nvtx = model->device == LLAISYS_DEVICE_NVIDIA;
-
     bool use_cache = model->use_kv_cache && (model->cache_len > 0 && ntoken == model->cache_len + 1);
     if (!use_cache) {
         model->cache_len = 0;
@@ -247,157 +405,11 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t
     const size_t cur_len = use_cache ? 1 : ntoken;
     const size_t pos_start = use_cache ? model->cache_len : 0;
     ensure_workspace(model, cur_len, device_id);
-
-    NvtxRange infer_range(use_cache ? "llaisys_decode" : "llaisys_prefill", enable_nvtx);
-
-    // 通过 slice 复用已经分配好的 workspace，避免每次 infer 都重新申请 GPU 中间张量。
     auto index = model->workspace.index->slice(0, 0, cur_len);
     index->load(token_ids + (ntoken - cur_len));
 
-    auto x = model->workspace.x->slice(0, 0, cur_len);
-    {
-        NvtxRange range("embedding", enable_nvtx);
-        llaisys::ops::embedding(x, index, unwrap(model->weights.in_embed));
-    }
-
-    if (!model->pos_ids_cache) {
-        model->pos_ids_cache = llaisys::Tensor::create({model->meta.maxseq}, LLAISYS_DTYPE_I64, model->device, device_id);
-        std::vector<int64_t> full_pos(model->meta.maxseq);
-        for (size_t i = 0; i < model->meta.maxseq; ++i) {
-            full_pos[i] = static_cast<int64_t>(i);
-        }
-        model->pos_ids_cache->load(full_pos.data());
-    }
-    auto pos_ids = model->pos_ids_cache->slice(0, pos_start, pos_start + cur_len);
-
-    auto x_cur = x;
-    auto attn_norm = model->workspace.attn_norm->slice(0, 0, cur_len);
-    auto q2d = model->workspace.q2d->slice(0, 0, cur_len);
-    auto k2d = model->workspace.k2d->slice(0, 0, cur_len);
-    auto v2d = model->workspace.v2d->slice(0, 0, cur_len);
-    auto q_rope = model->workspace.q_rope->slice(0, 0, cur_len);
-    auto k_rope = model->workspace.k_rope->slice(0, 0, cur_len);
-    auto attn = model->workspace.attn->slice(0, 0, cur_len);
-    auto attn_out = model->workspace.attn_out->slice(0, 0, cur_len);
-    auto x_attn = model->workspace.x_attn->slice(0, 0, cur_len);
-    auto mlp_norm = model->workspace.mlp_norm->slice(0, 0, cur_len);
-    auto gate = model->workspace.gate->slice(0, 0, cur_len);
-    auto up = model->workspace.up->slice(0, 0, cur_len);
-    auto hidden = model->workspace.hidden->slice(0, 0, cur_len);
-    auto mlp_out = model->workspace.mlp_out->slice(0, 0, cur_len);
-
-    for (size_t layer = 0; layer < model->meta.nlayer; ++layer) {
-        if (!model->weights.attn_norm_w[layer] || !model->weights.attn_q_w[layer]
-            || !model->weights.attn_k_w[layer] || !model->weights.attn_v_w[layer]
-            || !model->weights.attn_o_w[layer] || !model->weights.mlp_norm_w[layer]
-            || !model->weights.mlp_gate_w[layer] || !model->weights.mlp_up_w[layer]
-            || !model->weights.mlp_down_w[layer]) {
-            std::cerr << "[LLAISYS] qwen2 infer: missing weights at layer " << layer << std::endl;
-            return -1;
-        }
-
-        {
-            NvtxRange range("layer_attn", enable_nvtx);
-            llaisys::ops::rms_norm(attn_norm, x_cur, unwrap(model->weights.attn_norm_w[layer]), model->meta.epsilon);
-
-            llaisys::ops::linear(q2d, attn_norm, unwrap(model->weights.attn_q_w[layer]),
-                                 model->weights.attn_q_b ? unwrap(model->weights.attn_q_b[layer]) : nullptr);
-            llaisys::ops::linear(k2d, attn_norm, unwrap(model->weights.attn_k_w[layer]),
-                                 model->weights.attn_k_b ? unwrap(model->weights.attn_k_b[layer]) : nullptr);
-            llaisys::ops::linear(v2d, attn_norm, unwrap(model->weights.attn_v_w[layer]),
-                                 model->weights.attn_v_b ? unwrap(model->weights.attn_v_b[layer]) : nullptr);
-
-            auto q = q2d->view({cur_len, model->meta.nh, model->meta.dh});
-            auto k = k2d->view({cur_len, model->meta.nkvh, model->meta.dh});
-            auto v = v2d->view({cur_len, model->meta.nkvh, model->meta.dh});
-
-            llaisys::ops::rope(q_rope, q, pos_ids, model->meta.theta);
-            llaisys::ops::rope(k_rope, k, pos_ids, model->meta.theta);
-
-            if (!model->k_cache[layer]) {
-                model->k_cache[layer] = llaisys::Tensor::create(
-                    {model->meta.maxseq, model->meta.nkvh, model->meta.dh},
-                    model->meta.dtype, model->device, device_id);
-                model->v_cache[layer] = llaisys::Tensor::create(
-                    {model->meta.maxseq, model->meta.nkvh, model->meta.dh},
-                    model->meta.dtype, model->device, device_id);
-            }
-
-            if (use_cache) {
-                auto k_dst = model->k_cache[layer]->slice(0, pos_start, pos_start + cur_len);
-                auto v_dst = model->v_cache[layer]->slice(0, pos_start, pos_start + cur_len);
-                llaisys::ops::rearrange(k_dst, k_rope);
-                llaisys::ops::rearrange(v_dst, v);
-            } else {
-                auto k_dst = model->k_cache[layer]->slice(0, 0, ntoken);
-                auto v_dst = model->v_cache[layer]->slice(0, 0, ntoken);
-                llaisys::ops::rearrange(k_dst, k_rope);
-                llaisys::ops::rearrange(v_dst, v);
-            }
-
-            const size_t total_len = use_cache ? (model->cache_len + cur_len) : ntoken;
-            auto k_all = model->k_cache[layer]->slice(0, 0, total_len);
-            auto v_all = model->v_cache[layer]->slice(0, 0, total_len);
-
-            const float scale = 1.0f / std::sqrt(static_cast<float>(model->meta.dh));
-            llaisys::ops::self_attention(attn, q_rope, k_all, v_all, scale);
-
-            auto attn2d = attn->view({cur_len, model->meta.hs});
-            llaisys::ops::linear(attn_out, attn2d, unwrap(model->weights.attn_o_w[layer]), nullptr);
-            llaisys::ops::add(x_attn, x_cur, attn_out);
-        }
-
-        {
-            NvtxRange range("layer_mlp", enable_nvtx);
-            llaisys::ops::rms_norm(mlp_norm, x_attn, unwrap(model->weights.mlp_norm_w[layer]), model->meta.epsilon);
-            llaisys::ops::linear(gate, mlp_norm, unwrap(model->weights.mlp_gate_w[layer]), nullptr);
-            llaisys::ops::linear(up, mlp_norm, unwrap(model->weights.mlp_up_w[layer]), nullptr);
-            llaisys::ops::swiglu(hidden, gate, up);
-            llaisys::ops::linear(mlp_out, hidden, unwrap(model->weights.mlp_down_w[layer]), nullptr);
-            llaisys::ops::add(x_cur, x_attn, mlp_out);
-        }
-    }
-
-    if (!use_cache) {
-        model->cache_len = ntoken;
-    } else {
-        model->cache_len += cur_len;
-    }
-
-    auto normed = model->workspace.normed->slice(0, 0, cur_len);
-    {
-        NvtxRange range("lm_head", enable_nvtx);
-        llaisys::ops::rms_norm(normed, x_cur, unwrap(model->weights.out_norm_w), model->meta.epsilon);
-
-        // 只保留最后一个 token 的 lm_head 结果，避免在 prefill/decode 中重复算整段 logits。
-        auto last_normed = normed->slice(0, cur_len - 1, cur_len);
-        auto logits = model->workspace.logits;
-        llaisys::ops::linear(logits, last_normed, unwrap(model->weights.out_embed), nullptr);
-
-        auto logits_view = logits->view({model->meta.voc});
-        auto max_idx = model->workspace.max_idx;
-        auto max_val = model->workspace.max_val;
-        llaisys::ops::argmax(max_idx, max_val, logits_view);
-
-        llaisys::tensor_t max_idx_host = max_idx;
-        if (max_idx->deviceType() != LLAISYS_DEVICE_CPU) {
-            if (!model->workspace.max_idx_host) {
-                // 复用一个常驻的 pinned host buffer，避免每个 decode step 都重新申请/释放 host staging。
-                llaisys::core::context().setDevice(model->device, device_id);
-                model->workspace.max_idx_host = llaisys::Tensor::create({1}, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU);
-            }
-            llaisys::core::context().setDevice(max_idx->deviceType(), max_idx->deviceId());
-            llaisys::core::context().runtime().api()->memcpy_sync(
-                model->workspace.max_idx_host->data(),
-                max_idx->data(),
-                sizeof(int64_t),
-                LLAISYS_MEMCPY_D2H);
-            max_idx_host = model->workspace.max_idx_host;
-        }
-        auto *idx_ptr = reinterpret_cast<const int64_t *>(max_idx_host->data());
-        return idx_ptr[0];
-    }
-    return -1;
+    auto max_idx = qwen2_forward(model, index, ntoken, cur_len, pos_start, use_cache, device_id);
+    return copy_token_to_host(model, max_idx, device_id);
 }
 
 __export size_t llaisysQwen2ModelGenerate(
@@ -410,22 +422,49 @@ __export size_t llaisysQwen2ModelGenerate(
         return 0;
     }
 
-    // generate 是“完整一次生成”的高层接口，默认从当前 prompt 重新开始。
-    // 这样可以把 decode loop 下沉到 C++ backend，避免 Python 每个 token 往返一次。
+    // generate 是“完整一次生成”的高层接口，decode loop 保持在 backend 内部执行。
+    // 生成序列常驻 device，只在结束后一次性拷回 host，尽量避免逐 token 的 host/device 往返。
     llaisysQwen2ModelResetCache(model);
 
+    const int device_id = pick_device_id(model);
+    ensure_token_workspace(model, capacity, device_id);
+
+    auto generated_ids = model->workspace.generated_ids;
+    auto prompt_ids = generated_ids->slice(0, 0, ntoken);
+    prompt_ids->load(token_ids);
+
     size_t total = ntoken;
-    for (size_t step = 0; step < max_new_tokens; ++step) {
-        if (total >= capacity) {
-            break;
-        }
-        const int64_t next = llaisysQwen2ModelInfer(model, token_ids, total);
-        if (next < 0) {
-            break;
-        }
-        token_ids[total++] = next;
-        if (model->meta.end_token >= 0 && next == model->meta.end_token) {
-            break;
+    for (size_t step = 0; step < max_new_tokens && total < capacity; ++step) {
+        const bool use_cache = step > 0;
+        const size_t cur_len = use_cache ? 1 : ntoken;
+        const size_t pos_start = use_cache ? (total - 1) : 0;
+        auto index = use_cache ? generated_ids->slice(0, total - 1, total) : prompt_ids;
+        auto next_idx = qwen2_forward(model, index, total, cur_len, pos_start, use_cache, device_id);
+
+        auto dst = generated_ids->slice(0, total, total + 1);
+        llaisys::core::context().setDevice(next_idx->deviceType(), next_idx->deviceId());
+        llaisys::core::context().runtime().api()->memcpy_sync(
+            dst->data(),
+            next_idx->data(),
+            sizeof(int64_t),
+            LLAISYS_MEMCPY_D2D);
+        ++total;
+    }
+
+    auto out = generated_ids->slice(0, 0, total);
+    llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+    llaisys::core::context().runtime().api()->memcpy_sync(
+        token_ids,
+        out->data(),
+        total * sizeof(int64_t),
+        LLAISYS_MEMCPY_D2H);
+
+    if (model->meta.end_token >= 0) {
+        for (size_t i = ntoken; i < total; ++i) {
+            if (token_ids[i] == model->meta.end_token) {
+                total = i + 1;
+                break;
+            }
         }
     }
     return total;

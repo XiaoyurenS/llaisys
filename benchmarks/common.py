@@ -152,3 +152,17 @@ def measure_llaisys_decode(model, input_ids: list[int], new_tokens: int, device_
         generated.append(next_token)
 
     return generated, timings_ms
+
+
+def measure_llaisys_generate(model, input_ids: list[int], new_tokens: int, device_name: str) -> tuple[list[int], list[float]]:
+    model.reset_cache()
+
+    # backend-side generate 在 C++ 内部完成整段 decode loop。
+    # 这里只有一次总耗时，因此不再伪造逐 token timing，而是把总时长作为单独口径返回。
+    start = time.perf_counter()
+    generated = model.generate(input_ids, max_new_tokens=new_tokens)
+    sync_llaisys(device_name)
+    end = time.perf_counter()
+
+    total_ms = perf_ms(start, end)
+    return generated, [total_ms]
